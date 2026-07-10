@@ -29,29 +29,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy backend
+      - name: Deploy combined container
         uses: azure/cli@v2
         with:
           inlineScript: |
             az containerapp update \
-              --name backend \
+              --name turbo-ea \
               --resource-group turboea-rg \
-              --image ghcr.io/vinkbram/turbo-ea/backend:latest
-
-      - name: Deploy frontend
-        uses: azure/cli@v2
-        with:
-          inlineScript: |
-            az containerapp update \
-              --name frontend \
-              --resource-group turboea-rg \
-              --image ghcr.io/vinkbram/turbo-ea/frontend:latest
-
-      - name: Deploy nginx
-        uses: azure/cli@v2
-        with:
-          inlineScript: |
-            az containerapp update \
-              --name nginx \
-              --resource-group turboea-rg \
-              --image ghcr.io/vinkbram/turbo-ea/nginx:latest
+              --image ghcr.io/vinkbram/turbo-ea/combined:latest

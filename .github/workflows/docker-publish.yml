@@ -40,7 +40,7 @@ jobs:
         #     -t ghcr.io/vincentmakes/turbo-ea/ollama:latest \
         #     -t ghcr.io/vincentmakes/turbo-ea/ollama:0.70.0 \
         #     --push .
-        image: [db, backend, frontend, nginx, mcp-server]
+        image: [db, backend, frontend, nginx, mcp-server, combined]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 

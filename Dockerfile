@@ -596,3 +596,54 @@ USER ${APP_UID}:${APP_GID}
 
 EXPOSE 8001
 CMD ["python", "-m", "turbo_ea_mcp", "--host", "0.0.0.0", "--port", "8001"]
+
+
+# ---------------------------------------------------------------------------
+# Combined single-container target for PaaS platforms (Azure Container Apps,
+# Cloud Run, etc.) that expect one container per service. Runs nginx +
+# uvicorn via supervisord in a single container.
+# ---------------------------------------------------------------------------
+FROM python:3.12-alpine AS combined
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+RUN apk upgrade --no-cache && \
+    apk add --no-cache nginx supervisor && \
+    rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+# Backend — same as the standalone backend target
+COPY --from=backend-build /install /usr/local
+COPY --from=backend-build /app/VERSION ./VERSION
+COPY --from=backend-build /app/app ./app
+COPY --from=backend-build /app/alembic ./alembic
+COPY --from=backend-build /app/alembic.ini ./alembic.ini
+COPY --from=backend-build /app/bpmn_templates ./bpmn_templates
+
+# Frontend static files
+COPY --from=frontend-build /app/dist /usr/share/nginx/html
+
+# DrawIO static files
+COPY --from=drawio /drawio /usr/share/nginx/drawio
+COPY --from=frontend-build /app/drawio-config/PreConfig.js /usr/share/nginx/drawio/js/PreConfig.js
+COPY --from=frontend-build /app/drawio-config/PostConfig.js /usr/share/nginx/drawio/js/PostConfig.js
+
+# Nginx config — single-container variant (proxies /api/ to localhost:8000)
+COPY deploy/nginx-combined.conf /etc/nginx/http.d/default.conf
+# Remove the default nginx config that ships with alpine
+RUN rm -f /etc/nginx/http.d/default.conf.bak 2>/dev/null; \
+    sed -i '/^user\s\+/d' /etc/nginx/nginx.conf
+
+# Supervisord config
+COPY deploy/supervisord.conf /etc/supervisord.conf
+
+# Create non-root user and set permissions
+RUN addgroup -g ${APP_GID} -S appgroup && \
+    adduser -S -D -H -u ${APP_UID} -G appgroup appuser && \
+    mkdir -p /var/log/nginx /var/lib/nginx/tmp /run/nginx /tmp && \
+    chown -R ${APP_UID}:${APP_GID} /app /usr/share/nginx /var/log/nginx /var/lib/nginx /run/nginx /tmp
+
+EXPOSE 8080
+CMD ["supervisord", "-c", "/etc/supervisord.conf"]
