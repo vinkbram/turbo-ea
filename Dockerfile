@@ -246,8 +246,8 @@ ${nginx_https_ipv6_line}
     # if backend/frontend are recreated (new IP) while this nginx keeps running
     # — e.g. after \"docker compose pull && up -d\" — every proxied request 502s
     # until nginx restarts. Variable upstreams + resolver avoid that.
-    set \$backend_upstream http://backend:8000;
-    set \$frontend_upstream http://frontend:8080;
+    set \$backend_upstream http://${NGINX_BACKEND_HOST:-backend}:${NGINX_BACKEND_PORT:-8000};
+    set \$frontend_upstream http://${NGINX_FRONTEND_HOST:-frontend}:${NGINX_FRONTEND_PORT:-8080};
 
     add_header X-Frame-Options \"SAMEORIGIN\" always;
     add_header X-Content-Type-Options \"nosniff\" always;
@@ -408,8 +408,8 @@ ${nginx_http_ipv6_line}
     # if backend/frontend are recreated (new IP) while this nginx keeps running
     # — e.g. after \"docker compose pull && up -d\" — every proxied request 502s
     # until nginx restarts. Variable upstreams + resolver avoid that.
-    set \$backend_upstream http://backend:8000;
-    set \$frontend_upstream http://frontend:8080;
+    set \$backend_upstream http://${NGINX_BACKEND_HOST:-backend}:${NGINX_BACKEND_PORT:-8000};
+    set \$frontend_upstream http://${NGINX_FRONTEND_HOST:-frontend}:${NGINX_FRONTEND_PORT:-8080};
 
     add_header X-Frame-Options \"SAMEORIGIN\" always;
     add_header X-Content-Type-Options \"nosniff\" always;
