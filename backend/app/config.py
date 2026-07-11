@@ -101,6 +101,7 @@ class Settings:
 
     POSTGRES_SSL: bool = os.getenv("POSTGRES_SSL", "").lower() in ("1", "true", "yes", "require")
 
+    @property
     def database_url(self) -> str:
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
