@@ -625,14 +625,22 @@ COPY --from=backend-build /app/bpmn_templates ./bpmn_templates
 # Frontend static files
 COPY --from=frontend-build /app/dist /usr/share/nginx/html
 
-# DrawIO static files
+# DrawIO static files — clean up dead Java JARs (WEB-INF) that trigger
+# Trivy CVEs and strip service-worker references from DrawIO index.html
 COPY --from=drawio /drawio /usr/share/nginx/drawio
 COPY --from=frontend-build /app/drawio-config/PreConfig.js /usr/share/nginx/drawio/js/PreConfig.js
 COPY --from=frontend-build /app/drawio-config/PostConfig.js /usr/share/nginx/drawio/js/PostConfig.js
+RUN rm -rf /usr/share/nginx/drawio/WEB-INF && \
+    sed -i \
+      -e '/<link rel="manifest"/d' \
+      -e '/serviceWorker/d' \
+      /usr/share/nginx/drawio/index.html
+
+# Upgrade pip past known CVEs (never invoked at runtime, silences Trivy)
+RUN pip install --no-cache-dir --upgrade 'pip>=26.1'
 
 # Nginx config — single-container variant (proxies /api/ to localhost:8000)
 COPY deploy/nginx-combined.conf /etc/nginx/http.d/default.conf
-# Remove the default nginx config that ships with alpine
 RUN rm -f /etc/nginx/http.d/default.conf.bak 2>/dev/null; \
     sed -i '/^user\s\+/d' /etc/nginx/nginx.conf
 
