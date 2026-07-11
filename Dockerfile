@@ -637,8 +637,11 @@ RUN sed -i \
     -e 's/<head>/<head><!--email_off-->/' \
     /usr/share/nginx/drawio/index.html
 
-# Upgrade pip past known CVEs (never invoked at runtime, silences Trivy)
-RUN pip install --no-cache-dir --upgrade 'pip>=26.1'
+# MCP server — install alongside the backend in /app/mcp-server
+COPY mcp-server/ /app/mcp-server/
+COPY VERSION /app/mcp-server/VERSION
+RUN pip install --no-cache-dir --upgrade 'pip>=26.1' && \
+    pip install --no-cache-dir /app/mcp-server/
 
 # Nginx config — single-container variant (proxies /api/ to localhost:8000)
 COPY deploy/nginx-combined.conf /etc/nginx/http.d/default.conf
