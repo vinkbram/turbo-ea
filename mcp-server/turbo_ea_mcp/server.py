@@ -2201,6 +2201,78 @@ async def import_bpmn(
     return _fmt(response)
 
 
+# ── Azure Blob Storage (document management) ────────────────────────────────
+
+
+@mcp.tool(annotations=_READ_ANNOT)
+async def list_documents(prefix: str = "") -> str:
+    """List files in the EA document storage (Azure Blob Storage).
+
+    Args:
+        prefix: Optional path prefix to filter results (e.g. 'reports/').
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    from turbo_ea_mcp import blob_storage
+
+    if not blob_storage.is_configured():
+        return _fmt({"error": "Azure Blob Storage not configured (AZURE_STORAGE_CONNECTION_STRING)"})
+    blobs = await blob_storage.list_blobs(prefix=prefix)
+    return _fmt({"container": blob_storage._container_name(), "count": len(blobs), "files": blobs})
+
+
+@mcp.tool(annotations=_READ_ANNOT)
+async def read_document(name: str) -> str:
+    """Read a file from the EA document storage.
+
+    Returns the file content as UTF-8 text for text-based files, or
+    base64-encoded for binary files.
+
+    Args:
+        name: Full blob name/path (e.g. 'architecture/landscape.pdf').
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    from turbo_ea_mcp import blob_storage
+
+    if not blob_storage.is_configured():
+        return _fmt({"error": "Azure Blob Storage not configured (AZURE_STORAGE_CONNECTION_STRING)"})
+    result = await blob_storage.read_blob(name)
+    return _fmt(result)
+
+
+@mcp.tool(annotations=_WRITE_ADDITIVE_ANNOT)
+async def upload_document(
+    name: str,
+    content: str,
+    content_type: str = "text/plain",
+    dry_run: bool = True,
+) -> str:
+    """Upload a file to the EA document storage.
+
+    Args:
+        name: Blob name/path (e.g. 'reports/q3-review.md').
+        content: File content — UTF-8 string for text, base64-encoded for binary.
+        content_type: MIME type (default 'text/plain').
+        dry_run: When True (default), validate without uploading.
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    if (disabled := _writes_disabled_message()) is not None:
+        return disabled
+    from turbo_ea_mcp import blob_storage
+
+    if not blob_storage.is_configured():
+        return _fmt({"error": "Azure Blob Storage not configured (AZURE_STORAGE_CONNECTION_STRING)"})
+    if dry_run:
+        return _fmt({"dry_run": True, "would_upload": name, "content_type": content_type, "content_length": len(content)})
+    result = await blob_storage.upload_blob(name, content, content_type)
+    return _fmt(result)
+
+
 # ── Resources ───────────────────────────────────────────────────────────────
 
 

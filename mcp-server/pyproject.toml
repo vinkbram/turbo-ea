@@ -14,6 +14,7 @@ dependencies = [
     "pyjwt>=2.9.0",
     "starlette>=0.45.0",
     "uvicorn>=0.34.0",
+    "azure-storage-blob>=12.20.0",
 ]
 
 [project.optional-dependencies]
