@@ -630,11 +630,12 @@ COPY --from=frontend-build /app/dist /usr/share/nginx/html
 COPY --from=drawio /drawio /usr/share/nginx/drawio
 COPY --from=frontend-build /app/drawio-config/PreConfig.js /usr/share/nginx/drawio/js/PreConfig.js
 COPY --from=frontend-build /app/drawio-config/PostConfig.js /usr/share/nginx/drawio/js/PostConfig.js
-RUN rm -rf /usr/share/nginx/drawio/WEB-INF && \
-    sed -i \
-      -e '/<link rel="manifest"/d' \
-      -e '/serviceWorker/d' \
-      /usr/share/nginx/drawio/index.html
+RUN rm -rf /usr/share/nginx/drawio/WEB-INF
+RUN sed -i \
+    -e '/<link rel="manifest"/d' \
+    -e '/serviceWorker/d' \
+    -e 's/<head>/<head><!--email_off-->/' \
+    /usr/share/nginx/drawio/index.html
 
 # Upgrade pip past known CVEs (never invoked at runtime, silences Trivy)
 RUN pip install --no-cache-dir --upgrade 'pip>=26.1'
