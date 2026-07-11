@@ -49,7 +49,7 @@ export default function ResetPasswordPage() {
     e.preventDefault();
     setError("");
 
-    if (password.length < 10) {
+    if (password.length < 8) {
       setError(t("resetPassword.minLength"));
       return;
     }

@@ -56,7 +56,7 @@ export default function SetPasswordPage({ onSetPassword }: Props) {
     e.preventDefault();
     setError("");
 
-    if (password.length < 6) {
+    if (password.length < 8) {
       setError(t("setPassword.minLength"));
       return;
     }
