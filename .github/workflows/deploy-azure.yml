@@ -35,4 +35,4 @@ jobs:
             az containerapp update \
               --name turbo-ea \
               --resource-group turboea-rg \
-              --image ghcr.io/vinkbram/turbo-ea/combined:latest
+              --image ghcr.io/vinkbram/turbo-ea/combined:main

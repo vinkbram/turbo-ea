@@ -100,11 +100,16 @@ class Settings:
     AI_AUTO_CONFIGURE: bool = os.getenv("AI_AUTO_CONFIGURE", "").lower() in ("1", "true", "yes")
 
     @property
+    POSTGRES_SSL: str = os.getenv("POSTGRES_SSL", "")
+
     def database_url(self) -> str:
-        return (
+        url = (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+        if self.POSTGRES_SSL:
+            url += f"?ssl={self.POSTGRES_SSL}"
+        return url
 
 
 settings = Settings()
