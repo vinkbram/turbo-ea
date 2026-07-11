@@ -627,7 +627,7 @@ COPY --from=frontend-build /app/dist /usr/share/nginx/html
 
 # DrawIO static files — clean up dead Java JARs (WEB-INF) that trigger
 # Trivy CVEs and strip service-worker references from DrawIO index.html
-COPY --from=drawio /drawio /usr/share/nginx/drawio
+COPY --from=drawio /drawio/src/main/webapp /usr/share/nginx/drawio
 COPY --from=frontend-build /app/drawio-config/PreConfig.js /usr/share/nginx/drawio/js/PreConfig.js
 COPY --from=frontend-build /app/drawio-config/PostConfig.js /usr/share/nginx/drawio/js/PostConfig.js
 RUN rm -rf /usr/share/nginx/drawio/WEB-INF
