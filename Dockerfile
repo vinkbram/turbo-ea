@@ -609,7 +609,7 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 
 RUN apk upgrade --no-cache && \
-    apk add --no-cache nginx supervisor && \
+    apk add --no-cache nginx supervisor ca-certificates && \
     rm -rf /var/cache/apk/*
 
 WORKDIR /app
