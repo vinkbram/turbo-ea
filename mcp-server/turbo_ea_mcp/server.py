@@ -2462,6 +2462,8 @@ def create_app() -> Starlette:
             methods=["GET"],
         ),
         Route("/oauth/authorize", oauth.authorize, methods=["GET"]),
+        Route("/oauth/local-login", oauth.local_login_form, methods=["GET"]),
+        Route("/oauth/local-login", oauth.local_login_submit, methods=["POST"]),
         Route("/oauth/callback", oauth.sso_callback, methods=["GET"]),
         Route("/oauth/token", oauth.token_endpoint, methods=["POST"]),
         Route("/oauth/register", oauth.register_client, methods=["POST"]),

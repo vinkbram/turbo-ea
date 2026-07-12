@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlencode
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from turbo_ea_mcp import api_client
 from turbo_ea_mcp.config import MCP_OAUTH_ALLOWED_REDIRECT_URIS, MCP_PUBLIC_URL
@@ -284,14 +284,6 @@ async def authorize(request: Request) -> Response:
             status_code=400,
         )
 
-    # Get SSO config from Turbo EA
-    sso_config = await _get_sso_config()
-    if not sso_config.get("enabled"):
-        return JSONResponse(
-            {"error": "server_error", "error_description": "SSO not configured"},
-            status_code=503,
-        )
-
     # Store pending auth
     internal_state = secrets.token_urlsafe(32)
     store.pending[internal_state] = PendingAuth(
@@ -303,23 +295,29 @@ async def authorize(request: Request) -> Response:
         code_challenge_method=code_challenge_method,
     )
 
-    # Build SSO authorization URL (provider-agnostic — the backend provides
-    # the correct authorization_endpoint regardless of provider)
-    callback_url = f"{MCP_PUBLIC_URL.rstrip('/')}/oauth/callback"
-    sso_params = {
-        "client_id": sso_config["client_id"],
-        "response_type": "code",
-        "redirect_uri": callback_url,
-        "scope": "openid email profile",
-        "response_mode": "query",
-        "state": internal_state,
-    }
+    # Try SSO first; fall back to local login form if not configured
+    sso_config = await _get_sso_config()
+    if sso_config.get("enabled"):
+        # Build SSO authorization URL (provider-agnostic — the backend provides
+        # the correct authorization_endpoint regardless of provider)
+        callback_url = f"{MCP_PUBLIC_URL.rstrip('/')}/oauth/callback"
+        sso_params = {
+            "client_id": sso_config["client_id"],
+            "response_type": "code",
+            "redirect_uri": callback_url,
+            "scope": "openid email profile",
+            "response_mode": "query",
+            "state": internal_state,
+        }
+        authorization_endpoint = sso_config["authorization_endpoint"]
+        return RedirectResponse(
+            f"{authorization_endpoint}?{urlencode(sso_params)}",
+            status_code=302,
+        )
 
-    authorization_endpoint = sso_config["authorization_endpoint"]
-    return RedirectResponse(
-        f"{authorization_endpoint}?{urlencode(sso_params)}",
-        status_code=302,
-    )
+    # No SSO — show local login form
+    login_url = f"{MCP_PUBLIC_URL.rstrip('/')}/oauth/local-login?state={internal_state}"
+    return RedirectResponse(login_url, status_code=302)
 
 
 # ── SSO callback ────────────────────────────────────────────────────────────
@@ -420,6 +418,117 @@ async def sso_callback(request: Request) -> Response:
     # pending.redirect_uri was validated against the client's registration in
     # authorize() before this PendingAuth was ever stored — authorize() is the
     # only writer of store.pending.
+    redirect_params = urlencode({"code": our_code, "state": pending.state})
+    return RedirectResponse(
+        f"{pending.redirect_uri}?{redirect_params}", status_code=302
+    )
+
+
+# ── Local login (fallback when SSO is not configured) ───────────────────────
+
+_LOCAL_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Turbo EA — Sign in</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         display: flex; justify-content: center; align-items: center; min-height: 100vh;
+         margin: 0; background: #f5f5f5; }}
+  .card {{ background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.1);
+           width: 100%; max-width: 360px; }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 1.5rem; color: #1a1a1a; text-align: center; }}
+  label {{ display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.25rem; }}
+  input {{ width: 100%; padding: 0.6rem; margin-bottom: 1rem; border: 1px solid #ddd;
+           border-radius: 4px; font-size: 0.95rem; box-sizing: border-box; }}
+  button {{ width: 100%; padding: 0.7rem; background: #2563eb; color: #fff; border: none;
+            border-radius: 4px; font-size: 0.95rem; cursor: pointer; }}
+  button:hover {{ background: #1d4ed8; }}
+  .error {{ color: #dc2626; font-size: 0.85rem; margin-bottom: 1rem; text-align: center; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Turbo EA</h1>
+  {error}
+  <form method="POST" action="{action}">
+    <input type="hidden" name="state" value="{state}">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" required autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" required>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>"""
+
+
+async def local_login_form(request: Request) -> Response:
+    """Render a simple email/password login form."""
+    import html as html_mod
+
+    state = html_mod.escape(request.query_params.get("state", ""))
+    error_msg = html_mod.escape(request.query_params.get("error", ""))
+    error_html = f'<p class="error">{error_msg}</p>' if error_msg else ""
+    action = f"{MCP_PUBLIC_URL.rstrip('/')}/oauth/local-login"
+    page = _LOCAL_LOGIN_HTML.format(state=state, error=error_html, action=action)
+    return HTMLResponse(page)
+
+
+async def local_login_submit(request: Request) -> Response:
+    """Handle local login form submission — exchange credentials for JWT."""
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    state = form.get("state", "")
+    email = form.get("email", "")
+    password = form.get("password", "")
+
+    if not state or not email or not password:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    pending = store.pending.get(str(state))
+    if not pending:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Unknown or expired state"},
+            status_code=400,
+        )
+
+    # Authenticate via Turbo EA backend
+    try:
+        turbo_jwt = await api_client.login(str(email), str(password))
+    except ValueError:
+        logger.warning("Local login failed for %s (invalid credentials)", email)
+        login_url = (
+            f"{MCP_PUBLIC_URL.rstrip('/')}/oauth/local-login"
+            f"?state={state}&error=Invalid+email+or+password"
+        )
+        return RedirectResponse(login_url, status_code=302)
+    except Exception:
+        logger.exception("Backend error during local login for %s", email)
+        return JSONResponse(
+            {"error": "server_error", "error_description": "Authentication service unavailable"},
+            status_code=503,
+        )
+
+    # Remove from pending
+    store.pending.pop(str(state), None)
+
+    # Generate authorization code (same flow as SSO callback)
+    our_code = secrets.token_urlsafe(48)
+    store.codes[our_code] = AuthCode(
+        code=our_code,
+        client_id=pending.client_id,
+        redirect_uri=pending.redirect_uri,
+        scope=pending.scope,
+        code_challenge=pending.code_challenge,
+        turbo_jwt=turbo_jwt,
+    )
+
     redirect_params = urlencode({"code": our_code, "state": pending.state})
     return RedirectResponse(
         f"{pending.redirect_uri}?{redirect_params}", status_code=302
