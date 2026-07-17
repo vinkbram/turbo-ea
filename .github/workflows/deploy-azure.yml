@@ -32,7 +32,8 @@ jobs:
         uses: azure/cli@v2
         with:
           inlineScript: |
+            SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
             az containerapp update \
               --name turbo-ea \
               --resource-group turboea-rg \
-              --image ghcr.io/vinkbram/turbo-ea/combined:main
+              --image "ghcr.io/vinkbram/turbo-ea/combined:sha-${SHORT_SHA}"
