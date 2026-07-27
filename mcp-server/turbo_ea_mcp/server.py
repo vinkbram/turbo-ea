@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import textwrap
+import uuid
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
@@ -128,6 +129,73 @@ def _fmt(data: dict | list) -> str:
 def _compact(params: dict) -> dict:
     """Drop ``None`` and empty-string values so they don't clutter the URL."""
     return {k: v for k, v in params.items() if v not in (None, "")}
+
+
+def _index_tags(groups) -> tuple[dict, dict]:
+    """From ``GET /tag-groups``, build ``(by_name, by_qualified)`` lookups
+    for resolving tag *names* to ids. Bare tag names can collide across
+    groups, so a bare name resolves only when unique; a group-qualified
+    ``'Group / Tag'`` reference resolves within its group. Both maps hold
+    a *list* of ids per key so duplicate names (the backend has no
+    uniqueness constraint) surface as ambiguous rather than silently
+    picking one."""
+    by_name: dict[str, list[dict]] = {}
+    by_qualified: dict[tuple[str, str], list[str]] = {}
+    for g in groups if isinstance(groups, list) else []:
+        for t in g.get("tags", []) or []:
+            entry = {"tag_id": t["id"], "tag": t["name"], "group": g["name"]}
+            by_name.setdefault(t["name"].strip().lower(), []).append(entry)
+            by_qualified.setdefault(
+                (g["name"].strip().lower(), t["name"].strip().lower()), []
+            ).append(t["id"])
+    return by_name, by_qualified
+
+
+def _resolve_tag_ref(ref: str, by_name: dict, by_qualified: dict) -> dict:
+    """Resolve one tag reference to ``{ref, status, tag_id?/candidates?}``.
+
+    ``ref`` is a bare tag name (``'Commerce'``) or a group-qualified name
+    (``'Domain / Commerce'``). The qualifier separator is the exact
+    ``' / '`` (spaces) shown in the ambiguity report — so a tag whose own
+    name contains a bare ``'/'`` (e.g. ``'24/7 Support'``) is NOT
+    misparsed. If a ``' / '`` split doesn't hit a group, we fall back to
+    treating the whole ref as a bare tag name (covering the rare tag name
+    that literally contains ``' / '``). Mirrors ``resolve_card_refs``'
+    resolved / ambiguous / missing outcomes so the agent can recover."""
+    ref = (ref or "").strip()
+
+    def _bare(name: str) -> dict:
+        matches = by_name.get(name.lower(), [])
+        if len(matches) == 1:
+            return {
+                "ref": ref,
+                "status": "resolved",
+                "tag_id": matches[0]["tag_id"],
+                "group": matches[0]["group"],
+            }
+        if len(matches) > 1:
+            return {
+                "ref": ref,
+                "status": "ambiguous",
+                "candidates": [f"{m['group']} / {m['tag']}" for m in matches],
+            }
+        return {"ref": ref, "status": "missing"}
+
+    if " / " in ref:
+        grp, nm = (s.strip() for s in ref.split(" / ", 1))
+        ids = by_qualified.get((grp.lower(), nm.lower()), [])
+        if len(ids) == 1:
+            return {"ref": ref, "status": "resolved", "tag_id": ids[0]}
+        if len(ids) > 1:
+            return {
+                "ref": ref,
+                "status": "ambiguous",
+                "message": f"{len(ids)} tags named {nm!r} in group {grp!r} (duplicate names).",
+                "candidates": [f"{grp} / {nm}"],
+            }
+        # No such group/tag pair — maybe the tag name itself contains ' / '.
+        return _bare(ref)
+    return _bare(ref)
 
 
 # ── Tools ───────────────────────────────────────────────────────────────────
@@ -1164,6 +1232,395 @@ async def assign_stakeholders(operations: list[dict], dry_run: bool = True) -> s
             outcomes.append({"op": op, "result": resp})
         batch.summary = {"operations": len(operations)}
         return _fmt({"batch_id": batch.batch_id, "outcomes": outcomes})
+
+
+@mcp.tool(annotations=_READ_ANNOT)
+async def list_tag_groups() -> str:
+    """List every tag group and its tags (id, name, color, plus the
+    group's mode / mandatory / restrict_to_types).
+
+    This is the tag vocabulary — the tagging analog of ``list_card_types``.
+    ``assign_card_tags`` and ``create_tags`` resolve names for you, but
+    call this to see the full set and to disambiguate a tag name that is
+    used in more than one group.
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    client = TurboEAClient(token)
+    return _fmt(await client.get("/tag-groups"))
+
+
+@mcp.tool(annotations=_WRITE_ADDITIVE_ANNOT)
+async def assign_card_tags(
+    operations: list[dict], dry_run: bool = True, confirm_token: str = ""
+) -> str:
+    """Add or remove tags on cards, addressing tags by NAME.
+
+    Tags are an M:N vocabulary managed through dedicated endpoints — NOT
+    via ``update_cards_bulk``, whose ``CardUpdate`` schema silently drops
+    a ``tags`` field. Use this tool for tags.
+
+    Each op:
+      - ``{"action": "add", "card_id": "...", "tags": ["Commerce", "Domain / High"]}``
+        → ``POST /cards/{id}/tags`` (idempotent; skips tags already on the card)
+      - ``{"action": "remove", "card_id": "...", "tags": ["Commerce"]}``
+        → ``DELETE /cards/{id}/tags/{tag_id}`` per resolved tag
+
+    Tag references are NAMES, resolved against ``list_tag_groups``. A bare
+    name must be unique across all groups; if it collides, qualify it as
+    ``"Group / Tag"`` (exact ``' / '`` separator). Any unknown or ambiguous
+    name aborts the WHOLE call *during name resolution* (nothing written)
+    with a report so you can fix the name or create the tag first
+    (``create_tags``). Once resolution passes, each op is applied
+    independently: a per-op backend failure is recorded in ``outcomes``
+    and does NOT roll back sibling ops.
+
+    Permission: gated per-call on ``tags.manage`` OR edit rights on the
+    card (``inventory.edit`` / ``card.edit``) — anyone who can edit a card
+    can tag it.
+
+    Args:
+        operations: List of op dicts (see above).
+        dry_run: When True (default), resolve names and echo the planned
+            ops without persisting. Re-run with dry_run=False to commit.
+        confirm_token: Echoed back on commits above the per-call
+            confirmation threshold (issued by the prior dry-run).
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    if (disabled := _writes_disabled_message()) is not None:
+        return disabled
+    if len(operations) > MCP_MAX_CARDS_PER_CALL:
+        return _fmt(
+            {
+                "error": "batch_too_large",
+                "cap": MCP_MAX_CARDS_PER_CALL,
+                "received": len(operations),
+            }
+        )
+
+    # Validate every op's SHAPE up front so a malformed op can't cause a
+    # backend 500 mid-write (unguarded uuid.UUID) or iterate a string of
+    # tag chars. A bad shape aborts the whole call before anything runs.
+    for i, op in enumerate(operations):
+        if not isinstance(op, dict) or "card_id" not in op:
+            return _fmt(
+                {
+                    "error": "invalid_op",
+                    "message": "Each op must be a dict with a card_id.",
+                    "op_index": i,
+                    "op": op,
+                }
+            )
+        try:
+            uuid.UUID(str(op["card_id"]))
+        except (ValueError, TypeError, AttributeError):
+            return _fmt(
+                {
+                    "error": "invalid_card_id",
+                    "message": "card_id must be a card UUID.",
+                    "op_index": i,
+                    "card_id": op.get("card_id"),
+                }
+            )
+        op_tags = op.get("tags", [])
+        if not isinstance(op_tags, list) or not all(isinstance(t, str) for t in op_tags):
+            return _fmt(
+                {
+                    "error": "invalid_tags",
+                    "message": "'tags' must be a list of tag-name strings.",
+                    "op_index": i,
+                    "tags": op_tags,
+                }
+            )
+        if op.get("action", "add") not in ("add", "remove"):
+            return _fmt(
+                {
+                    "error": "invalid_action",
+                    "message": "action must be 'add' or 'remove'.",
+                    "op_index": i,
+                    "action": op.get("action"),
+                }
+            )
+
+    if not dry_run:
+        gate = _confirmation_required_message("assign_card_tags", len(operations))
+        if gate is not None and not confirm_token:
+            return gate
+
+    # Resolve every tag name up front against the live vocabulary. Fail
+    # fast (nothing written) if any name is unknown or ambiguous.
+    by_name, by_qual = _index_tags(await TurboEAClient(token).get("/tag-groups"))
+    plan: list[dict] = []
+    problems: list[dict] = []
+    for i, op in enumerate(operations):
+        tag_ids: list[str] = []
+        for ref in op.get("tags", []):
+            r = _resolve_tag_ref(ref, by_name, by_qual)
+            if r["status"] == "resolved":
+                tag_ids.append(r["tag_id"])
+            else:
+                problems.append({"op_index": i, **r})
+        plan.append(
+            {
+                "action": op.get("action", "add"),
+                "card_id": op["card_id"],
+                "tags": op.get("tags", []),
+                "tag_ids": tag_ids,
+            }
+        )
+    if problems:
+        return _fmt(
+            {
+                "error": "tag_resolution_failed",
+                "message": (
+                    "Some tag names could not be resolved; nothing was written. "
+                    "Qualify ambiguous names as 'Group / Tag', or create the tag "
+                    "first with create_tags."
+                ),
+                "problems": problems,
+            }
+        )
+
+    import httpx
+
+    async with mutation_batch(
+        token,
+        tool_name="assign_card_tags",
+        row_count=len(operations),
+        dry_run=dry_run,
+        confirm_token=confirm_token or None,
+    ) as batch:
+        if dry_run:
+            data: dict = {"dry_run": True, "operations": plan, "batch_id": batch.batch_id}
+            if batch.confirm_token_issued:
+                data["confirm_token"] = batch.confirm_token_issued
+            batch.summary = {"operations": len(plan)}
+            return _fmt(data)
+        client = batch.client()
+        outcomes: list[dict] = []
+        for p in plan:
+            try:
+                if p["action"] == "add":
+                    resp = await client.post(f"/cards/{p['card_id']}/tags", json=p["tag_ids"])
+                else:  # remove (validated above)
+                    for tid in p["tag_ids"]:
+                        await client.delete(f"/cards/{p['card_id']}/tags/{tid}")
+                    resp = {"status": "removed", "tag_ids": p["tag_ids"]}
+            except httpx.HTTPStatusError as exc:
+                resp = {
+                    "status": "error",
+                    "http_status": exc.response.status_code,
+                    "detail": exc.response.text[:200],
+                }
+            outcomes.append({"op": p, "result": resp})
+        errors = sum(1 for o in outcomes if o["result"].get("status") == "error")
+        batch.summary = {"operations": len(plan), "errors": errors}
+        return _fmt({"batch_id": batch.batch_id, "errors": errors, "outcomes": outcomes})
+
+
+@mcp.tool(annotations=_WRITE_ADDITIVE_ANNOT)
+async def create_tag_group(
+    name: str,
+    description: str = "",
+    mode: str = "multi",
+    mandatory: bool = False,
+    restrict_to_types: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Create a tag group (the container tags live in).
+
+    Args:
+        name: Group name (shown as the tag category).
+        description: Optional group description.
+        mode: ``"multi"`` (default, many tags per card) or ``"single"``
+            (one tag from this group per card).
+        mandatory: When True, a card of an applicable type must carry a
+            tag from this group before it can be approved, and the group
+            feeds the data-quality score. Leave False unless you intend
+            that governance behaviour.
+        restrict_to_types: Card type keys the group applies to
+            (e.g. ``["Application"]``); None = all types.
+        dry_run: When True (default), preview without persisting.
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    if (disabled := _writes_disabled_message()) is not None:
+        return disabled
+    if mode not in ("single", "multi"):
+        return _fmt(
+            {"error": "invalid_mode", "message": "mode must be 'single' or 'multi'.", "mode": mode}
+        )
+    # The backend has no name-uniqueness constraint, so a re-run would
+    # silently create a duplicate group (which then makes every qualified
+    # tag ref in that group ambiguous). Refuse an existing name.
+    existing = await TurboEAClient(token).get("/tag-groups")
+    dupe = next(
+        (
+            g
+            for g in (existing if isinstance(existing, list) else [])
+            if (g.get("name") or "").strip().lower() == name.strip().lower()
+        ),
+        None,
+    )
+    if dupe:
+        return _fmt(
+            {
+                "error": "group_exists",
+                "message": f"A tag group named {name!r} already exists — add tags to it "
+                "with create_tags instead of creating a duplicate.",
+                "group_id": dupe.get("id"),
+            }
+        )
+    payload = {
+        "name": name,
+        "description": description,
+        "mode": mode,
+        "mandatory": mandatory,
+        "restrict_to_types": restrict_to_types,
+    }
+    if dry_run:
+        return _fmt({"dry_run": True, "would_create_group": payload})
+    async with mutation_batch(
+        token, tool_name="create_tag_group", row_count=1, dry_run=False
+    ) as batch:
+        data = await batch.client().post("/tag-groups", json=payload)
+        batch.summary = {"created_group": data.get("id") if isinstance(data, dict) else None}
+        return _fmt({"batch_id": batch.batch_id, "group": data})
+
+
+@mcp.tool(annotations=_WRITE_ADDITIVE_ANNOT)
+async def create_tags(
+    group: str, tags: list[dict], dry_run: bool = True, confirm_token: str = ""
+) -> str:
+    """Create tags inside a group, addressing the group by NAME.
+
+    Args:
+        group: The group's name (resolved via ``list_tag_groups``) or its
+            UUID (case-insensitive). Fails clearly if the group is unknown
+            or the name is used by more than one group.
+        tags: One dict per tag: ``{"name": "...", "color"?: "#hex",
+            "description"?: "..."}``.
+        dry_run: When True (default), preview without persisting.
+        confirm_token: Echoed back on commits above the per-call
+            confirmation threshold (issued by the prior dry-run).
+
+    Idempotent: tags whose name already exists in the group (or repeats
+    within this call) are skipped and reported under ``already_exist``,
+    not duplicated — the backend has no uniqueness constraint, and a
+    duplicate name would poison later name resolution. Fans out one
+    ``POST /tag-groups/{group_id}/tags`` per new tag in one mutation batch.
+    """
+    token = await _get_current_token()
+    if not token:
+        return "Error: Not authenticated. Please reconnect."
+    if (disabled := _writes_disabled_message()) is not None:
+        return disabled
+    if len(tags) > MCP_MAX_CARDS_PER_CALL:
+        return _fmt(
+            {"error": "batch_too_large", "cap": MCP_MAX_CARDS_PER_CALL, "received": len(tags)}
+        )
+    for i, t in enumerate(tags):
+        if not isinstance(t, dict) or not (t.get("name") or "").strip():
+            return _fmt(
+                {
+                    "error": "invalid_tag",
+                    "message": "Each tag must be a dict with a non-empty 'name'.",
+                    "index": i,
+                    "tag": t,
+                }
+            )
+    groups = await TurboEAClient(token).get("/tag-groups")
+    glist = groups if isinstance(groups, list) else []
+    gl = group.strip().lower()
+    group_obj = next((g for g in glist if (g.get("id") or "").lower() == gl), None)
+    if group_obj is None:
+        matches = [g for g in glist if (g.get("name") or "").strip().lower() == gl]
+        if len(matches) == 1:
+            group_obj = matches[0]
+        elif len(matches) > 1:
+            return _fmt(
+                {
+                    "error": "ambiguous_group",
+                    "message": f"More than one tag group is named {group!r}; pass its UUID.",
+                    "candidates": [{"id": g["id"], "name": g["name"]} for g in matches],
+                }
+            )
+    if group_obj is None:
+        return _fmt(
+            {
+                "error": "group_not_found",
+                "message": (
+                    f"No tag group matches {group!r}. Create it first with create_tag_group."
+                ),
+                "available": [g.get("name") for g in glist],
+            }
+        )
+    gid = group_obj["id"]
+    existing = {(t.get("name") or "").strip().lower() for t in (group_obj.get("tags") or [])}
+    to_create: list[dict] = []
+    skipped: list[str] = []
+    seen: set[str] = set()
+    for t in tags:
+        nm = t["name"].strip().lower()
+        if nm in existing or nm in seen:
+            skipped.append(t["name"])
+        else:
+            to_create.append(t)
+            seen.add(nm)
+
+    if not dry_run:
+        gate = _confirmation_required_message("create_tags", len(to_create))
+        if gate is not None and not confirm_token:
+            return gate
+
+    import httpx
+
+    async with mutation_batch(
+        token,
+        tool_name="create_tags",
+        row_count=len(to_create),
+        dry_run=dry_run,
+        confirm_token=confirm_token or None,
+    ) as batch:
+        if dry_run:
+            data: dict = {
+                "dry_run": True,
+                "group_id": gid,
+                "would_create": to_create,
+                "already_exist": skipped,
+                "batch_id": batch.batch_id,
+            }
+            if batch.confirm_token_issued:
+                data["confirm_token"] = batch.confirm_token_issued
+            batch.summary = {"would_create": len(to_create), "skipped": len(skipped)}
+            return _fmt(data)
+        client = batch.client()
+        created: list = []
+        errors: list[dict] = []
+        for t in to_create:
+            try:
+                created.append(await client.post(f"/tag-groups/{gid}/tags", json=t))
+            except httpx.HTTPStatusError as exc:
+                errors.append(
+                    {
+                        "tag": t.get("name"),
+                        "http_status": exc.response.status_code,
+                        "detail": exc.response.text[:200],
+                    }
+                )
+        batch.summary = {"created": len(created), "skipped": len(skipped), "errors": len(errors)}
+        return _fmt(
+            {
+                "batch_id": batch.batch_id,
+                "tags": created,
+                "already_exist": skipped,
+                "errors": errors,
+            }
+        )
 
 
 @mcp.tool(annotations=_READ_ANNOT)

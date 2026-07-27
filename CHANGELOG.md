@@ -5,6 +5,11 @@ All notable changes to Turbo EA are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.70.0] - 2026-07-27
+
+### Added
+- **MCP tag tools.** The MCP server can now read and write card tags — previously impossible, since `update_cards_bulk` silently dropped a `tags` field. Four new tools: `list_tag_groups` (the tag vocabulary), `assign_card_tags` (add/remove tags on cards, addressing tags **by name** with `'Group / Tag'` disambiguation and a fail-fast resolution report when a name is unknown or ambiguous), `create_tag_group`, and `create_tags` (idempotent — names already in the group are skipped, not duplicated). Bulk commits above the confirmation threshold require a `confirm_token` from a prior dry-run, op shape is validated up front (card ids must be UUIDs), and a per-op backend failure is isolated in the response rather than rolling back its siblings.
+
 ## [1.69.2] - 2026-07-09
 
 ### Fixed

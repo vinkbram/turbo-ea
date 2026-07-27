@@ -47,7 +47,7 @@ class TurboEAClient:
                 return {}
             return resp.json()
 
-    async def post(self, path: str, json: dict | None = None) -> dict | list:
+    async def post(self, path: str, json: dict | list | None = None) -> dict | list:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{self._base}{path}",
@@ -71,12 +71,23 @@ class TurboEAClient:
                 return {}
             return resp.json()
 
-    async def patch(self, path: str, json: dict | None = None) -> dict | list:
+    async def patch(self, path: str, json: dict | list | None = None) -> dict | list:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.patch(
                 f"{self._base}{path}",
                 headers=self._headers(),
                 json=json,
+            )
+            resp.raise_for_status()
+            if resp.status_code == 204:
+                return {}
+            return resp.json()
+
+    async def delete(self, path: str) -> dict | list:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.delete(
+                f"{self._base}{path}",
+                headers=self._headers(),
             )
             resp.raise_for_status()
             if resp.status_code == 204:
