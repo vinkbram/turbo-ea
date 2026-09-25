@@ -9,7 +9,11 @@ description = "MCP server for Turbo EA — AI tool access to EA data plus artifa
 license = "FSL-1.1-MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.9.0",
+    # Pinned below 2.0: mcp 2.x renames FastMCP -> MCPServer and changes the
+    # decorator/transport APIs this server is built on, so an unpinned install
+    # resolves to 2.x and crashes at import with ModuleNotFoundError on
+    # mcp.server.fastmcp. Lift only together with the v2 migration.
+    "mcp>=1.9.0,<2",
     "httpx>=0.28.0",
     "pyjwt>=2.9.0",
     "starlette>=0.45.0",
