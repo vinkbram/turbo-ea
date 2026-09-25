@@ -147,6 +147,71 @@ async def _ops_access_maintenance_loop() -> None:
             logger.exception("Error in ops access maintenance loop")
 
 
+async def _purge_archived_cards_once(db, cutoff) -> tuple[int, int]:
+    """Permanently delete every card archived on or before ``cutoff``.
+
+    Returns ``(purged_count, stranded_count)``, where ``stranded_count`` counts
+    surviving children detached from a purged parent. Split out of the loop so
+    the tests drive this implementation instead of a copy of it.
+    """
+    from sqlalchemy import or_, select
+
+    from app.models.card import Card
+    from app.models.relation import Relation
+
+    result = await db.execute(
+        select(Card).where(
+            Card.status == "ARCHIVED",
+            Card.archived_at.isnot(None),
+            Card.archived_at <= cutoff,
+        )
+    )
+    cards_to_purge = result.scalars().all()
+    if not cards_to_purge:
+        return 0, 0
+
+    purged_ids = [c.id for c in cards_to_purge]
+
+    # Delete relations referencing these cards
+    rels = await db.execute(
+        select(Relation).where(
+            or_(
+                Relation.source_id.in_(purged_ids),
+                Relation.target_id.in_(purged_ids),
+            )
+        )
+    )
+    for rel in rels.scalars().all():
+        await db.delete(rel)
+
+    # Detach every card whose `parent_id` points at one we are about to purge —
+    # including cards inside the purge set itself. `cards.parent_id` is a self-FK
+    # with no ON DELETE rule, and `Card.children` is viewonly, so the unit of work
+    # does not order child deletes ahead of parent deletes: it batches them into a
+    # single executemany, and Postgres rejects a parent row while a child still
+    # references it. Detaching first makes delete order irrelevant. Restricting
+    # this to cards *outside* the purge set (as an earlier version did) meant any
+    # parent and child that aged out in the same cycle wedged the loop forever.
+    children_res = await db.execute(select(Card).where(Card.parent_id.in_(purged_ids)))
+    purged_id_set = set(purged_ids)
+    stranded_count = 0
+    for child in children_res.scalars().all():
+        if child.id not in purged_id_set:
+            # Survives the purge and becomes a root.
+            stranded_count += 1
+        child.parent_id = None
+
+    # Flush the detach ahead of the deletes so no parent is ever removed while a
+    # child row still carries its id.
+    await db.flush()
+
+    for card in cards_to_purge:
+        await db.delete(card)
+
+    await db.commit()
+    return len(purged_ids), stranded_count
+
+
 async def _purge_archived_cards_loop() -> None:
     """Background loop that permanently deletes cards archived past the
     admin-configured retention window.
@@ -159,12 +224,10 @@ async def _purge_archived_cards_loop() -> None:
     """
     from datetime import datetime, timezone
 
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
 
     from app.database import async_session
     from app.models.app_settings import AppSettings
-    from app.models.card import Card
-    from app.models.relation import Relation
 
     while True:
         try:
@@ -179,51 +242,13 @@ async def _purge_archived_cards_loop() -> None:
                 if cutoff is None:
                     # Retention disabled (0) — keep archived cards indefinitely.
                     continue
-                result = await db.execute(
-                    select(Card).where(
-                        Card.status == "ARCHIVED",
-                        Card.archived_at.isnot(None),
-                        Card.archived_at <= cutoff,
-                    )
-                )
-                cards_to_purge = result.scalars().all()
-                if not cards_to_purge:
+                purged_count, stranded_count = await _purge_archived_cards_once(db, cutoff)
+                if not purged_count:
                     continue
-
-                purged_ids = [c.id for c in cards_to_purge]
-                # Delete relations referencing these cards
-                rels = await db.execute(
-                    select(Relation).where(
-                        or_(
-                            Relation.source_id.in_(purged_ids),
-                            Relation.target_id.in_(purged_ids),
-                        )
-                    )
-                )
-                for rel in rels.scalars().all():
-                    await db.delete(rel)
-
-                # Self-heal stranded children: any card whose `parent_id` still
-                # points at a card we're about to purge gets disconnected first.
-                # Without this the self-FK on `cards.parent_id` (no ON DELETE
-                # rule) blocks the delete. Covers historical data created before
-                # the child-strategy feature shipped.
-                stranded_res = await db.execute(
-                    select(Card).where(Card.parent_id.in_(purged_ids), Card.id.not_in(purged_ids))
-                )
-                stranded_count = 0
-                for stranded in stranded_res.scalars().all():
-                    stranded.parent_id = None
-                    stranded_count += 1
-
-                for card in cards_to_purge:
-                    await db.delete(card)
-
-                await db.commit()
                 logger.info(
                     "Auto-purged %d archived cards (archived before %s); "
                     "disconnected %d stranded child(ren).",
-                    len(purged_ids),
+                    purged_count,
                     cutoff.isoformat(),
                     stranded_count,
                 )

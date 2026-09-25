@@ -43,46 +43,17 @@ async def purge_env(db):
 
 
 async def _run_purge(db):
-    """Execute the purge logic (extracted from _purge_archived_cards_loop)."""
-    from sqlalchemy import or_
+    """Drive the real purge implementation the background loop uses.
+
+    Deliberately calls production code rather than re-implementing it: an
+    earlier copy of the logic here drifted from main.py and hid a foreign-key
+    bug that only showed up in production.
+    """
+    from app.main import _purge_archived_cards_once
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=_PURGE_RETENTION_DAYS)
-    result = await db.execute(
-        select(Card).where(
-            Card.status == "ARCHIVED",
-            Card.archived_at.isnot(None),
-            Card.archived_at <= cutoff,
-        )
-    )
-    cards_to_purge = result.scalars().all()
-    if not cards_to_purge:
-        return 0
-
-    purged_ids = [c.id for c in cards_to_purge]
-    # Delete relations referencing these cards
-    rels = await db.execute(
-        select(Relation).where(
-            or_(
-                Relation.source_id.in_(purged_ids),
-                Relation.target_id.in_(purged_ids),
-            )
-        )
-    )
-    for rel in rels.scalars().all():
-        await db.delete(rel)
-
-    # Self-heal stranded children — mirrors the production purge loop.
-    stranded_res = await db.execute(
-        select(Card).where(Card.parent_id.in_(purged_ids), Card.id.not_in(purged_ids))
-    )
-    for stranded in stranded_res.scalars().all():
-        stranded.parent_id = None
-
-    for card in cards_to_purge:
-        await db.delete(card)
-
-    await db.commit()
-    return len(purged_ids)
+    purged_count, _stranded = await _purge_archived_cards_once(db, cutoff)
+    return purged_count
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +262,69 @@ class TestPurgeArchivedCards:
         child_row = (await db.execute(select(Card).where(Card.id == child.id))).scalar_one()
         assert child_row.parent_id is None
         assert child_row.status == "ACTIVE"
+
+    async def test_purge_parent_and_child_together(self, db, purge_env):
+        """A parent and its child that both age out in the same cycle must purge.
+
+        Regression test: `cards.parent_id` is a self-FK with no ON DELETE rule and
+        `Card.children` is viewonly, so SQLAlchemy batches both deletes into one
+        executemany with no guaranteed child-before-parent ordering. The purge used
+        to detach only children *outside* the purge set, so Postgres rejected the
+        parent delete with ForeignKeyViolationError and the loop failed every cycle
+        from then on, purging nothing.
+        """
+        archived_at = datetime.now(timezone.utc) - timedelta(days=45)
+        parent = await create_card(
+            db,
+            card_type="Application",
+            name="Old Parent",
+            status="ARCHIVED",
+            user_id=purge_env["user"].id,
+        )
+        parent.archived_at = archived_at
+        child = await create_card(
+            db,
+            card_type="Application",
+            name="Old Child",
+            status="ARCHIVED",
+            parent_id=parent.id,
+            user_id=purge_env["user"].id,
+        )
+        child.archived_at = archived_at
+        await db.flush()
+
+        count = await _run_purge(db)
+        assert count == 2
+
+        for card_id in (parent.id, child.id):
+            row = (await db.execute(select(Card).where(Card.id == card_id))).scalar_one_or_none()
+            assert row is None
+
+    async def test_purge_grandparent_chain(self, db, purge_env):
+        """A three-level chain aging out together purges without FK errors."""
+        archived_at = datetime.now(timezone.utc) - timedelta(days=45)
+        ids = []
+        parent_id = None
+        for name in ("Gen1", "Gen2", "Gen3"):
+            card = await create_card(
+                db,
+                card_type="Application",
+                name=name,
+                status="ARCHIVED",
+                parent_id=parent_id,
+                user_id=purge_env["user"].id,
+            )
+            card.archived_at = archived_at
+            await db.flush()
+            ids.append(card.id)
+            parent_id = card.id
+
+        count = await _run_purge(db)
+        assert count == 3
+
+        for card_id in ids:
+            row = (await db.execute(select(Card).where(Card.id == card_id))).scalar_one_or_none()
+            assert row is None
 
     async def test_mix_of_old_and_recent(self, db, purge_env):
         """Only old archived cards are purged; recent ones are kept."""
