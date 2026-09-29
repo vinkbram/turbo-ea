@@ -96,14 +96,26 @@ class TestRegisterValidation:
         )
         assert resp.status_code == 422
 
-    async def test_register_password_no_uppercase(self, client, db):
-        """Password without uppercase letter fails validation."""
+    async def test_register_password_no_uppercase_accepted(self, client, db):
+        """Uppercase is not required: length + a letter + a digit is enough."""
         resp = await client.post(
             "/api/v1/auth/register",
             json={
                 "email": "noup@test.com",
                 "display_name": "No Upper",
                 "password": "nouppercase1234",
+            },
+        )
+        assert resp.status_code == 200
+
+    async def test_register_password_no_letter(self, client, db):
+        """Password with no letter fails validation."""
+        resp = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "noletter@test.com",
+                "display_name": "No Letter",
+                "password": "12345678",
             },
         )
         assert resp.status_code == 422

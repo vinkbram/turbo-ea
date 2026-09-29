@@ -203,25 +203,35 @@ class TestPasswordStrength:
         result = _validate_password_strength("MyPassword1")
         assert result == "MyPassword1"
 
-    def test_valid_exactly_10_chars(self):
+    def test_valid_ten_chars(self):
         result = _validate_password_strength("Abcde12345")
         assert result == "Abcde12345"
 
     def test_too_short(self):
-        with pytest.raises(ValueError, match="at least 10 characters"):
+        with pytest.raises(ValueError, match="at least 8 characters"):
             _validate_password_strength("Short1A")
 
-    def test_no_uppercase(self):
-        with pytest.raises(ValueError, match="uppercase letter"):
-            _validate_password_strength("alllowercase1")
+    def test_no_uppercase_is_allowed(self):
+        """Uppercase is not required — only length, a letter and a digit."""
+        result = _validate_password_strength("alllowercase1")
+        assert result == "alllowercase1"
 
     def test_no_digit(self):
         with pytest.raises(ValueError, match="one digit"):
             _validate_password_strength("NoDigitHere")
 
-    def test_exactly_9_chars_fails(self):
-        with pytest.raises(ValueError, match="at least 10"):
-            _validate_password_strength("Abcde1234")
+    def test_no_letter(self):
+        with pytest.raises(ValueError, match="one letter"):
+            _validate_password_strength("12345678")
+
+    def test_exactly_8_chars_ok(self):
+        """8 characters is the lower bound and must be accepted."""
+        result = _validate_password_strength("Abcde123")
+        assert result == "Abcde123"
+
+    def test_seven_chars_fails(self):
+        with pytest.raises(ValueError, match="at least 8"):
+            _validate_password_strength("Abcde12")
 
     def test_long_valid_password(self):
         result = _validate_password_strength("A" + "x" * 50 + "1")
@@ -253,7 +263,7 @@ class TestRegisterRequest:
                 display_name="Test",
                 password="weak",
             )
-        assert "10 characters" in str(exc_info.value)
+        assert "8 characters" in str(exc_info.value)
 
     def test_invalid_email_rejected(self):
         with pytest.raises(ValidationError):
